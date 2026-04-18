@@ -6,6 +6,7 @@
 
 - 单文件页面：`../text-transfer.html`
 - 构建输出：`dist/text-transfer.html`
+- GitHub Pages 发布页：`docs/index.html`
 
 ## 使用
 
@@ -35,3 +36,9 @@ cd /Users/guopeixin/code/text-transfer-tool
 npm install
 npm run build
 ```
+
+执行 `npm run build` 后会同时更新：
+
+- `dist/text-transfer.html`：本地构建产物（已忽略，不提交）
+- `docs/index.html`：GitHub Pages 首页（提交到仓库）
+- `../text-transfer.html`：仓库外的单文件副本，便于本地直接打开
