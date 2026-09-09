@@ -392,30 +392,9 @@
     <section class="hero">
       <div>
         <div class="eyebrow">TXT QR / offline relay</div>
-        <h1>把长文本折成可扫码的光。</h1>
-        <p class="hero-copy">给内网环境做的轻量文本传输工具。电脑贴入文本，页面离线生成二维码；手机打开同一个页面进入接收模式，连续扫码后自动拼回完整内容。</p>
         <div class="mode-switch" aria-label="模式切换">
           <button type="button" data-mode="send" class="is-active">发送</button>
           <button type="button" data-mode="receive">接收</button>
-        </div>
-      </div>
-
-      <div class="hero-grid">
-        <div class="stat">
-          <strong>单文件</strong>
-          <span>最终产物是一个离线 HTML，不需要服务器，也不连外网。</span>
-        </div>
-        <div class="stat">
-          <strong>自动分片</strong>
-          <span>短文本走单码直传；长文本自动拆成多张二维码。</span>
-        </div>
-        <div class="stat">
-          <strong>手机接收</strong>
-          <span>接收页支持摄像头连续扫描，也支持导入二维码图片识别。</span>
-        </div>
-        <div class="stat">
-          <strong>中文稳定</strong>
-          <span>统一按 UTF-8 编码，再做 Base64URL 分片，避免乱码与换行歧义。</span>
         </div>
       </div>
     </section>
@@ -423,21 +402,18 @@
     <section class="workspace">
       <section class="panel" data-panel="send">
         <div class="panel-header">
-          <div>
-            <h2>发送端</h2>
-            <p>输入文本后自动判断是单码直传，还是分片传输。</p>
-          </div>
+          <h2>发送</h2>
           <div class="metric-row">
             <span class="meta-pill">字符 <strong id="char-count">0</strong></span>
             <span class="meta-pill">字节 <strong id="byte-count">0</strong></span>
           </div>
         </div>
 
-        <textarea id="text-input" placeholder="把要传到手机的文本粘贴在这里。短文本可以单扫即得；长文本会自动拆成多张二维码。"></textarea>
+        <textarea id="text-input" placeholder="粘贴要传输的文本。"></textarea>
 
         <div class="button-row" style="margin-top:16px;">
           <button type="button" class="secondary-button" id="generate-button">生成二维码</button>
-          <button type="button" class="ghost-button" id="clear-input-button">清空输入</button>
+          <button type="button" class="ghost-button" id="clear-input-button">清空</button>
         </div>
 
         <div class="qr-stage">
@@ -449,15 +425,12 @@
               <span class="meta-pill" id="packet-meta">等待生成</span>
               <span class="meta-pill" id="session-info">等待生成</span>
             </div>
-            <p id="packet-hint" class="support-note">文本会自动判断走单码或分片模式。</p>
+            <p id="packet-hint" class="support-note" hidden></p>
             <div class="button-row">
               <button type="button" class="ghost-button" id="prev-button" disabled>上一张</button>
               <button type="button" class="ghost-button" id="next-button" disabled>下一张</button>
               <button type="button" class="button" id="auto-button" disabled>自动轮播</button>
-              <button type="button" class="ghost-button" id="copy-packet-button" disabled>复制当前码内容</button>
-            </div>
-            <div class="callout">
-              使用建议：长文本模式下，把电脑亮度调高，手机打开接收页后连续扫码即可。若某台设备不支持摄像头扫码，可切换到图片识别做兜底。
+              <button type="button" class="ghost-button" id="copy-packet-button" disabled>复制内容</button>
             </div>
           </div>
         </div>
@@ -465,10 +438,7 @@
 
       <section class="panel" data-panel="receive" hidden>
         <div class="panel-header">
-          <div>
-            <h2>接收端</h2>
-            <p>同一页面在手机浏览器打开后，切到接收模式即可连续扫码。</p>
-          </div>
+          <h2>接收</h2>
           <div class="metric-row">
             <span class="meta-pill" id="result-meta">暂无接收结果</span>
           </div>
@@ -495,10 +465,8 @@
           <div class="button-row">
             <button type="button" class="button" id="copy-result-button">复制结果</button>
             <button type="button" class="ghost-button" id="download-result-button">导出 txt</button>
-            <button type="button" class="ghost-button" id="clear-receive-button">清空接收</button>
+            <button type="button" class="ghost-button" id="clear-receive-button">清空</button>
           </div>
-
-          <p class="support-note">识别策略：优先使用浏览器原生 `BarcodeDetector`，不可用时退回到内置 `jsQR` 解码，因此在无网环境下依然可用。</p>
         </div>
       </section>
     </section>
@@ -12639,7 +12607,10 @@
       var MAX_QR_VERSION = 16;
       var CHUNK_ECC_LEVELS = ["M", "L"];
       var SINGLE_ECC_LEVELS = ["M", "L"];
-      var AUTO_ADVANCE_MS = 1400;
+      var AUTO_ADVANCE_MS = 700;
+      function isMobileDevice() {
+        return window.matchMedia("(max-width: 1024px)").matches || navigator.maxTouchPoints > 0 && /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+      }
       var state = {
         packets: [],
         packetIndex: 0,
@@ -12922,6 +12893,9 @@
         els.resultOutput.value = decoded;
         els.resultMeta.textContent = `\u5DF2\u5B8C\u6210\u62FC\u63A5 \xB7 ${decoded.length} \u5B57\u7B26 \xB7 ${new TextEncoder().encode(decoded).length} \u5B57\u8282`;
         setToast("\u5DF2\u6536\u9F50\u5168\u90E8\u5206\u7247\u3002");
+        if (state.stream) {
+          stopCamera();
+        }
       }
       function consumeDecodedText(raw) {
         if (!raw || raw === state.lastScanValue) {
@@ -12939,6 +12913,9 @@
           els.resultMeta.textContent = `\u5355\u7801\u6587\u672C \xB7 ${raw.length} \u5B57\u7B26 \xB7 ${new TextEncoder().encode(raw).length} \u5B57\u8282`;
           els.receiveSessionInfo.textContent = "\u5DF2\u6536\u5230\u5355\u7801\u6587\u672C";
           setToast("\u6536\u5230\u5355\u7801\u6587\u672C\u3002");
+          if (state.stream) {
+            stopCamera();
+          }
           return;
         }
         if (!state.scanSession || state.scanSession.transferId !== packet.transferId) {
@@ -13135,7 +13112,7 @@
         updateInputMetrics();
         updateSendUi();
         resetReceiveState();
-        setActiveMode("send");
+        setActiveMode(isMobileDevice() ? "receive" : "send");
       }
       init();
     }

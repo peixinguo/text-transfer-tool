@@ -5,7 +5,12 @@ const PROTOCOL = 'TXTQR1';
 const MAX_QR_VERSION = 16;
 const CHUNK_ECC_LEVELS = ['M', 'L'];
 const SINGLE_ECC_LEVELS = ['M', 'L'];
-const AUTO_ADVANCE_MS = 1400;
+const AUTO_ADVANCE_MS = 700;
+
+function isMobileDevice() {
+  return window.matchMedia('(max-width: 1024px)').matches
+    || (navigator.maxTouchPoints > 0 && /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent));
+}
 
 const state = {
   packets: [],
@@ -333,6 +338,9 @@ function tryAssembleSession() {
   els.resultOutput.value = decoded;
   els.resultMeta.textContent = `已完成拼接 · ${decoded.length} 字符 · ${new TextEncoder().encode(decoded).length} 字节`;
   setToast('已收齐全部分片。');
+  if (state.stream) {
+    stopCamera();
+  }
 }
 
 function consumeDecodedText(raw) {
@@ -352,6 +360,9 @@ function consumeDecodedText(raw) {
     els.resultMeta.textContent = `单码文本 · ${raw.length} 字符 · ${new TextEncoder().encode(raw).length} 字节`;
     els.receiveSessionInfo.textContent = '已收到单码文本';
     setToast('收到单码文本。');
+    if (state.stream) {
+      stopCamera();
+    }
     return;
   }
 
@@ -565,7 +576,7 @@ function init() {
   updateInputMetrics();
   updateSendUi();
   resetReceiveState();
-  setActiveMode('send');
+  setActiveMode(isMobileDevice() ? 'receive' : 'send');
 }
 
 init();
