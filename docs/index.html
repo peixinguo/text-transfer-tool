@@ -12604,6 +12604,9 @@
       var import_qrcode = __toESM(require_browser());
       var import_jsqr = __toESM(require_jsQR());
       var PROTOCOL = "TXTQR1";
+      var COMPRESSED_PROTOCOL = "TXTQR2";
+      var CODEC_RAW = "raw";
+      var CODEC_GZIP = "gz";
       var MAX_QR_VERSION = 16;
       var CHUNK_ECC_LEVELS = ["M", "L"];
       var SINGLE_ECC_LEVELS = ["M", "L"];
@@ -12684,17 +12687,55 @@
         }
         return bytes;
       }
+      async function streamBytes(bytes, streamCtor, format) {
+        const stream = new Blob([bytes]).stream().pipeThrough(new streamCtor(format));
+        return new Uint8Array(await new Response(stream).arrayBuffer());
+      }
+      async function gzipBytes(bytes) {
+        if (!("CompressionStream" in window)) {
+          return null;
+        }
+        try {
+          return await streamBytes(bytes, window.CompressionStream, "gzip");
+        } catch (error) {
+          console.warn("Compression failed", error);
+          return null;
+        }
+      }
+      async function gunzipBytes(bytes) {
+        if (!("DecompressionStream" in window)) {
+          throw new Error("\u5F53\u524D\u6D4F\u89C8\u5668\u4E0D\u652F\u6301\u89E3\u538B\u7F29\uFF0C\u8BF7\u6362\u7528\u65B0\u7248 Chrome\u3001Edge \u6216 Safari \u540E\u91CD\u8BD5\u3002");
+        }
+        return streamBytes(bytes, window.DecompressionStream, "gzip");
+      }
+      function formatBytes(bytes) {
+        if (bytes < 1024) {
+          return `${bytes} B`;
+        }
+        return `${(bytes / 1024).toFixed(1)} KB`;
+      }
       function createTransferId() {
         return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`.toUpperCase();
       }
       function parsePacket(raw) {
         const parts = raw.split("|");
-        if (parts.length !== 5 || parts[0] !== PROTOCOL) {
+        if (parts.length !== 5 && parts.length !== 6) {
+          return null;
+        }
+        if (parts[0] !== PROTOCOL && parts[0] !== COMPRESSED_PROTOCOL) {
+          return null;
+        }
+        const isCompressedProtocol = parts[0] === COMPRESSED_PROTOCOL;
+        if (isCompressedProtocol && parts.length !== 6 || !isCompressedProtocol && parts.length !== 5) {
           return null;
         }
         const index = Number.parseInt(parts[2], 10);
         const total = Number.parseInt(parts[3], 10);
+        const codec = isCompressedProtocol ? parts[4] : CODEC_RAW;
         if (!Number.isInteger(index) || !Number.isInteger(total) || index < 1 || total < 1 || index > total) {
+          return null;
+        }
+        if (isCompressedProtocol && codec !== CODEC_RAW && codec !== CODEC_GZIP) {
           return null;
         }
         return {
@@ -12702,7 +12743,8 @@
           transferId: parts[1],
           index,
           total,
-          payload: parts[4]
+          codec,
+          payload: isCompressedProtocol ? parts[5] : parts[4]
         };
       }
       function tryCreateQr(value, level) {
@@ -12713,20 +12755,13 @@
           return null;
         }
       }
-      function splitIntoPackets(text) {
-        const trimmed = text;
-        for (const level of SINGLE_ECC_LEVELS) {
-          const qr = tryCreateQr(trimmed, level);
-          if (qr) {
-            return {
-              mode: "single",
-              ecc: level,
-              packets: [{ text: trimmed, index: 1, total: 1, qr, ecc: level }]
-            };
-          }
+      function createPacketContent(protocol, transferId, index, total, codec, payload) {
+        if (protocol === COMPRESSED_PROTOCOL) {
+          return `${protocol}|${transferId}|${index}|${total}|${codec}|${payload}`;
         }
-        const transferId = createTransferId();
-        const encoded = toBase64Url(new TextEncoder().encode(trimmed));
+        return `${protocol}|${transferId}|${index}|${total}|${payload}`;
+      }
+      function createPacketSet({ encoded, protocol, codec, transferId, compression }) {
         for (const level of CHUNK_ECC_LEVELS) {
           let total = 1;
           let chunkSize = 0;
@@ -12736,7 +12771,7 @@
             let best = 0;
             while (low <= high) {
               const mid = Math.floor((low + high) / 2);
-              const probe = `${PROTOCOL}|${transferId}|${total}|${total}|${encoded.slice(0, mid)}`;
+              const probe = createPacketContent(protocol, transferId, total, total, codec, encoded.slice(0, mid));
               if (tryCreateQr(probe, level)) {
                 best = mid;
                 low = mid + 1;
@@ -12763,21 +12798,82 @@
           for (let index = 1; index <= total; index += 1) {
             const start = (index - 1) * chunkSize;
             const payload = encoded.slice(start, start + chunkSize);
-            const content = `${PROTOCOL}|${transferId}|${index}|${total}|${payload}`;
+            const content = createPacketContent(protocol, transferId, index, total, codec, payload);
             const qr = tryCreateQr(content, level);
             if (!qr) {
               valid = false;
               break;
             }
-            packets.push({ text: content, index, total, qr, ecc: level });
+            packets.push({
+              text: content,
+              index,
+              total,
+              qr,
+              ecc: level,
+              codec,
+              compression
+            });
           }
           if (valid) {
             return {
-              mode: "chunked",
+              mode: total === 1 ? "encoded-single" : "chunked",
               ecc: level,
-              packets
+              packets,
+              compression
             };
           }
+        }
+        return null;
+      }
+      async function splitIntoPackets(text) {
+        const trimmed = text;
+        for (const level of SINGLE_ECC_LEVELS) {
+          const qr = tryCreateQr(trimmed, level);
+          if (qr) {
+            return {
+              mode: "single",
+              ecc: level,
+              packets: [{ text: trimmed, index: 1, total: 1, qr, ecc: level }]
+            };
+          }
+        }
+        const rawBytes = new TextEncoder().encode(trimmed);
+        const rawEncoded = toBase64Url(rawBytes);
+        const compressedBytes = await gzipBytes(rawBytes);
+        const compressedEncoded = compressedBytes ? toBase64Url(compressedBytes) : "";
+        const useCompression = compressedBytes && compressedEncoded.length < rawEncoded.length;
+        const transferId = createTransferId();
+        const rawCompression = {
+          enabled: false,
+          originalBytes: rawBytes.length,
+          transferBytes: rawBytes.length,
+          ratio: 1
+        };
+        const gzipCompression = useCompression ? {
+          enabled: true,
+          originalBytes: rawBytes.length,
+          transferBytes: compressedBytes.length,
+          ratio: compressedBytes.length / rawBytes.length
+        } : null;
+        const preferred = useCompression ? createPacketSet({
+          encoded: compressedEncoded,
+          protocol: COMPRESSED_PROTOCOL,
+          codec: CODEC_GZIP,
+          transferId,
+          compression: gzipCompression
+        }) : null;
+        if (preferred) {
+          return preferred;
+        }
+        const fallback = createPacketSet({
+          encoded: rawEncoded,
+          protocol: PROTOCOL,
+          codec: CODEC_RAW,
+          transferId,
+          compression: rawCompression
+        });
+        if (fallback) {
+          return fallback;
         }
         throw new Error("\u6587\u672C\u8FC7\u957F\uFF0C\u8D85\u51FA\u5F53\u524D\u4E8C\u7EF4\u7801\u5206\u7247\u4E0A\u9650\u3002");
       }
@@ -12796,9 +12892,11 @@
             light: "#f5f1e8"
           }
         });
-        const isSingle = state.packets.length === 1 && !parsePacket(packet.text);
-        els.packetMeta.textContent = isSingle ? "\u5355\u7801\u76F4\u4F20 \xB7 \u7CFB\u7EDF\u76F8\u673A\u53EF\u76F4\u63A5\u8BC6\u522B\u6587\u672C" : `\u5206\u7247 ${packet.index} / ${packet.total}`;
-        els.packetHint.textContent = isSingle ? "\u77ED\u6587\u672C\u6A21\u5F0F\uFF1A\u624B\u673A\u626B\u8FD9\u4E00\u5F20\u5C31\u80FD\u76F4\u63A5\u770B\u5230\u5185\u5BB9\u3002" : "\u957F\u6587\u672C\u6A21\u5F0F\uFF1A\u624B\u673A\u5728\u63A5\u6536\u9875\u8FDE\u7EED\u626B\u7801\uFF0C\u6536\u9F50\u540E\u81EA\u52A8\u62FC\u63A5\u3002";
+        const parsedPacket = parsePacket(packet.text);
+        const isSingle = state.packets.length === 1 && !parsedPacket;
+        const isCompressed = parsedPacket?.codec === CODEC_GZIP;
+        els.packetMeta.textContent = isSingle ? "\u5355\u7801\u76F4\u4F20 \xB7 \u7CFB\u7EDF\u76F8\u673A\u53EF\u76F4\u63A5\u8BC6\u522B\u6587\u672C" : `${state.packets.length === 1 ? "\u538B\u7F29\u5355\u7801" : `\u5206\u7247 ${packet.index} / ${packet.total}`}${isCompressed ? " \xB7 gzip" : ""}`;
+        els.packetHint.textContent = isSingle ? "\u77ED\u6587\u672C\u6A21\u5F0F\uFF1A\u624B\u673A\u626B\u8FD9\u4E00\u5F20\u5C31\u80FD\u76F4\u63A5\u770B\u5230\u5185\u5BB9\u3002" : "\u957F\u6587\u672C\u6A21\u5F0F\uFF1A\u624B\u673A\u5728\u63A5\u6536\u9875\u8FDE\u7EED\u626B\u7801\uFF0C\u6536\u9F50\u540E\u81EA\u52A8\u62FC\u63A5\u5E76\u89E3\u7801\u3002";
         els.prevButton.disabled = index === 0;
         els.nextButton.disabled = index === state.packets.length - 1;
         els.copyPacketButton.disabled = false;
@@ -12850,11 +12948,14 @@
         }
         stopAutoAdvance();
         try {
-          const result = splitIntoPackets(text);
+          els.generateButton.disabled = true;
+          els.generateButton.textContent = "\u751F\u6210\u4E2D...";
+          const result = await splitIntoPackets(text);
           state.packets = result.packets;
           state.packetIndex = 0;
           await renderPacket(0);
-          els.sendSessionInfo.textContent = result.mode === "single" ? `\u5DF2\u751F\u6210 1 \u5F20\u4E8C\u7EF4\u7801 \xB7 \u7EA0\u9519 ${result.ecc}` : `\u5DF2\u751F\u6210 ${result.packets.length} \u5F20\u4E8C\u7EF4\u7801 \xB7 \u7EA0\u9519 ${result.ecc}`;
+          const compressionText = result.compression?.enabled ? ` \xB7 gzip ${formatBytes(result.compression.originalBytes)} -> ${formatBytes(result.compression.transferBytes)}` : "";
+          els.sendSessionInfo.textContent = result.mode === "single" ? `\u5DF2\u751F\u6210 1 \u5F20\u4E8C\u7EF4\u7801 \xB7 \u7EA0\u9519 ${result.ecc}` : `\u5DF2\u751F\u6210 ${result.packets.length} \u5F20\u4E8C\u7EF4\u7801 \xB7 \u7EA0\u9519 ${result.ecc}${compressionText}`;
           updateSendUi();
           setToast(result.mode === "single" ? "\u5DF2\u751F\u6210\u5355\u7801\u3002" : `\u5DF2\u751F\u6210 ${result.packets.length} \u4E2A\u5206\u7247\u3002`);
         } catch (error) {
@@ -12862,6 +12963,9 @@
           state.packets = [];
           updateSendUi();
           setToast(error.message || "\u751F\u6210\u5931\u8D25\uFF0C\u8BF7\u7F29\u77ED\u6587\u672C\u540E\u91CD\u8BD5\u3002");
+        } finally {
+          els.generateButton.disabled = false;
+          els.generateButton.textContent = "\u751F\u6210\u4E8C\u7EF4\u7801";
         }
       }
       function resetReceiveState() {
@@ -12880,7 +12984,14 @@
         const received = session.parts.filter(Boolean).length;
         els.receiveSessionInfo.textContent = `\u4F1A\u8BDD ${session.transferId} \xB7 \u5DF2\u6536 ${received}/${session.total}`;
       }
-      function tryAssembleSession() {
+      async function decodePacketPayload(packet, joined) {
+        const bytes = fromBase64Url(joined);
+        if (packet.codec === CODEC_GZIP) {
+          return new TextDecoder().decode(await gunzipBytes(bytes));
+        }
+        return new TextDecoder().decode(bytes);
+      }
+      async function tryAssembleSession() {
         const session = state.scanSession;
         if (!session) {
           return;
@@ -12889,15 +13000,20 @@
           return;
         }
         const joined = session.parts.join("");
-        const decoded = new TextDecoder().decode(fromBase64Url(joined));
-        els.resultOutput.value = decoded;
-        els.resultMeta.textContent = `\u5DF2\u5B8C\u6210\u62FC\u63A5 \xB7 ${decoded.length} \u5B57\u7B26 \xB7 ${new TextEncoder().encode(decoded).length} \u5B57\u8282`;
-        setToast("\u5DF2\u6536\u9F50\u5168\u90E8\u5206\u7247\u3002");
-        if (state.stream) {
-          stopCamera();
+        try {
+          const decoded = await decodePacketPayload(session, joined);
+          els.resultOutput.value = decoded;
+          els.resultMeta.textContent = `\u5DF2\u5B8C\u6210\u62FC\u63A5 \xB7 ${decoded.length} \u5B57\u7B26 \xB7 ${new TextEncoder().encode(decoded).length} \u5B57\u8282`;
+          setToast(session.codec === CODEC_GZIP ? "\u5DF2\u6536\u9F50\u5E76\u89E3\u538B\u3002" : "\u5DF2\u6536\u9F50\u5168\u90E8\u5206\u7247\u3002");
+          if (state.stream) {
+            stopCamera();
+          }
+        } catch (error) {
+          console.error(error);
+          setToast(error.message || "\u89E3\u7801\u5931\u8D25\uFF0C\u8BF7\u91CD\u65B0\u626B\u63CF\u3002");
         }
       }
-      function consumeDecodedText(raw) {
+      async function consumeDecodedText(raw) {
         if (!raw || raw === state.lastScanValue) {
           return;
         }
@@ -12922,19 +13038,21 @@
           state.scanSession = {
             transferId: packet.transferId,
             total: packet.total,
+            codec: packet.codec,
             parts: new Array(packet.total).fill("")
           };
         }
-        if (state.scanSession.total !== packet.total) {
+        if (state.scanSession.total !== packet.total || state.scanSession.codec !== packet.codec) {
           state.scanSession = {
             transferId: packet.transferId,
             total: packet.total,
+            codec: packet.codec,
             parts: new Array(packet.total).fill("")
           };
         }
         state.scanSession.parts[packet.index - 1] = packet.payload;
         updateSessionUi();
-        tryAssembleSession();
+        await tryAssembleSession();
       }
       async function decodeBitmapWithNative(bitmapSource) {
         if (!("BarcodeDetector" in window)) {
@@ -12974,7 +13092,7 @@
         ctx.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
         const value = await decodeFromCanvas(captureCanvas);
         if (value) {
-          consumeDecodedText(value);
+          await consumeDecodedText(value);
         }
       }
       async function startCamera() {
@@ -13031,7 +13149,7 @@
           setToast("\u8FD9\u5F20\u56FE\u7247\u91CC\u6CA1\u6709\u8BC6\u522B\u5230\u4E8C\u7EF4\u7801\u3002");
           return;
         }
-        consumeDecodedText(value);
+        await consumeDecodedText(value);
         setToast("\u56FE\u7247\u8BC6\u522B\u5B8C\u6210\u3002");
       }
       function downloadResult() {

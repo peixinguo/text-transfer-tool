@@ -2,6 +2,9 @@ import QRCode from 'qrcode';
 import jsQR from 'jsqr';
 
 const PROTOCOL = 'TXTQR1';
+const COMPRESSED_PROTOCOL = 'TXTQR2';
+const CODEC_RAW = 'raw';
+const CODEC_GZIP = 'gz';
 const MAX_QR_VERSION = 16;
 const CHUNK_ECC_LEVELS = ['M', 'L'];
 const SINGLE_ECC_LEVELS = ['M', 'L'];
@@ -91,18 +94,60 @@ function fromBase64Url(value) {
   return bytes;
 }
 
+async function streamBytes(bytes, streamCtor, format) {
+  const stream = new Blob([bytes]).stream().pipeThrough(new streamCtor(format));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+async function gzipBytes(bytes) {
+  if (!('CompressionStream' in window)) {
+    return null;
+  }
+  try {
+    return await streamBytes(bytes, window.CompressionStream, 'gzip');
+  } catch (error) {
+    console.warn('Compression failed', error);
+    return null;
+  }
+}
+
+async function gunzipBytes(bytes) {
+  if (!('DecompressionStream' in window)) {
+    throw new Error('当前浏览器不支持解压缩，请换用新版 Chrome、Edge 或 Safari 后重试。');
+  }
+  return streamBytes(bytes, window.DecompressionStream, 'gzip');
+}
+
+function formatBytes(bytes) {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  return `${(bytes / 1024).toFixed(1)} KB`;
+}
+
 function createTransferId() {
   return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`.toUpperCase();
 }
 
 function parsePacket(raw) {
   const parts = raw.split('|');
-  if (parts.length !== 5 || parts[0] !== PROTOCOL) {
+  if (parts.length !== 5 && parts.length !== 6) {
+    return null;
+  }
+  if (parts[0] !== PROTOCOL && parts[0] !== COMPRESSED_PROTOCOL) {
+    return null;
+  }
+  const isCompressedProtocol = parts[0] === COMPRESSED_PROTOCOL;
+  if ((isCompressedProtocol && parts.length !== 6) || (!isCompressedProtocol && parts.length !== 5)) {
     return null;
   }
   const index = Number.parseInt(parts[2], 10);
   const total = Number.parseInt(parts[3], 10);
+  const codec = isCompressedProtocol ? parts[4] : CODEC_RAW;
   if (!Number.isInteger(index) || !Number.isInteger(total) || index < 1 || total < 1 || index > total) {
+    return null;
+  }
+  if (isCompressedProtocol && codec !== CODEC_RAW && codec !== CODEC_GZIP) {
     return null;
   }
   return {
@@ -110,13 +155,9 @@ function parsePacket(raw) {
     transferId: parts[1],
     index,
     total,
-    payload: parts[4],
+    codec,
+    payload: isCompressedProtocol ? parts[5] : parts[4],
   };
-}
-
-function estimateHeaderLength(transferId, total) {
-  const digits = String(total).length;
-  return `${PROTOCOL}|${transferId}|${'9'.repeat(digits)}|${'9'.repeat(digits)}|`.length;
 }
 
 function tryCreateQr(value, level) {
@@ -128,22 +169,14 @@ function tryCreateQr(value, level) {
   }
 }
 
-function splitIntoPackets(text) {
-  const trimmed = text;
-  for (const level of SINGLE_ECC_LEVELS) {
-    const qr = tryCreateQr(trimmed, level);
-    if (qr) {
-      return {
-        mode: 'single',
-        ecc: level,
-        packets: [{ text: trimmed, index: 1, total: 1, qr, ecc: level }],
-      };
-    }
+function createPacketContent(protocol, transferId, index, total, codec, payload) {
+  if (protocol === COMPRESSED_PROTOCOL) {
+    return `${protocol}|${transferId}|${index}|${total}|${codec}|${payload}`;
   }
+  return `${protocol}|${transferId}|${index}|${total}|${payload}`;
+}
 
-  const transferId = createTransferId();
-  const encoded = toBase64Url(new TextEncoder().encode(trimmed));
-
+function createPacketSet({ encoded, protocol, codec, transferId, compression }) {
   for (const level of CHUNK_ECC_LEVELS) {
     let total = 1;
     let chunkSize = 0;
@@ -155,7 +188,7 @@ function splitIntoPackets(text) {
 
       while (low <= high) {
         const mid = Math.floor((low + high) / 2);
-        const probe = `${PROTOCOL}|${transferId}|${total}|${total}|${encoded.slice(0, mid)}`;
+        const probe = createPacketContent(protocol, transferId, total, total, codec, encoded.slice(0, mid));
         if (tryCreateQr(probe, level)) {
           best = mid;
           low = mid + 1;
@@ -187,24 +220,93 @@ function splitIntoPackets(text) {
     for (let index = 1; index <= total; index += 1) {
       const start = (index - 1) * chunkSize;
       const payload = encoded.slice(start, start + chunkSize);
-      const content = `${PROTOCOL}|${transferId}|${index}|${total}|${payload}`;
+      const content = createPacketContent(protocol, transferId, index, total, codec, payload);
       const qr = tryCreateQr(content, level);
       if (!qr) {
         valid = false;
         break;
       }
-      packets.push({ text: content, index, total, qr, ecc: level });
+      packets.push({
+        text: content,
+        index,
+        total,
+        qr,
+        ecc: level,
+        codec,
+        compression,
+      });
     }
 
     if (valid) {
       return {
-        mode: 'chunked',
+        mode: total === 1 ? 'encoded-single' : 'chunked',
         ecc: level,
         packets,
+        compression,
       };
     }
   }
 
+  return null;
+}
+
+async function splitIntoPackets(text) {
+  const trimmed = text;
+  for (const level of SINGLE_ECC_LEVELS) {
+    const qr = tryCreateQr(trimmed, level);
+    if (qr) {
+      return {
+        mode: 'single',
+        ecc: level,
+        packets: [{ text: trimmed, index: 1, total: 1, qr, ecc: level }],
+      };
+    }
+  }
+
+  const rawBytes = new TextEncoder().encode(trimmed);
+  const rawEncoded = toBase64Url(rawBytes);
+  const compressedBytes = await gzipBytes(rawBytes);
+  const compressedEncoded = compressedBytes ? toBase64Url(compressedBytes) : '';
+  const useCompression = compressedBytes && compressedEncoded.length < rawEncoded.length;
+  const transferId = createTransferId();
+  const rawCompression = {
+    enabled: false,
+    originalBytes: rawBytes.length,
+    transferBytes: rawBytes.length,
+    ratio: 1,
+  };
+  const gzipCompression = useCompression
+    ? {
+      enabled: true,
+      originalBytes: rawBytes.length,
+      transferBytes: compressedBytes.length,
+      ratio: compressedBytes.length / rawBytes.length,
+    }
+    : null;
+
+  const preferred = useCompression
+    ? createPacketSet({
+      encoded: compressedEncoded,
+      protocol: COMPRESSED_PROTOCOL,
+      codec: CODEC_GZIP,
+      transferId,
+      compression: gzipCompression,
+    })
+    : null;
+  if (preferred) {
+    return preferred;
+  }
+
+  const fallback = createPacketSet({
+    encoded: rawEncoded,
+    protocol: PROTOCOL,
+    codec: CODEC_RAW,
+    transferId,
+    compression: rawCompression,
+  });
+  if (fallback) {
+    return fallback;
+  }
   throw new Error('文本过长，超出当前二维码分片上限。');
 }
 
@@ -224,13 +326,15 @@ async function renderPacket(index) {
     },
   });
 
-  const isSingle = state.packets.length === 1 && !parsePacket(packet.text);
+  const parsedPacket = parsePacket(packet.text);
+  const isSingle = state.packets.length === 1 && !parsedPacket;
+  const isCompressed = parsedPacket?.codec === CODEC_GZIP;
   els.packetMeta.textContent = isSingle
     ? '单码直传 · 系统相机可直接识别文本'
-    : `分片 ${packet.index} / ${packet.total}`;
+    : `${state.packets.length === 1 ? '压缩单码' : `分片 ${packet.index} / ${packet.total}`}${isCompressed ? ' · gzip' : ''}`;
   els.packetHint.textContent = isSingle
     ? '短文本模式：手机扫这一张就能直接看到内容。'
-    : '长文本模式：手机在接收页连续扫码，收齐后自动拼接。';
+    : '长文本模式：手机在接收页连续扫码，收齐后自动拼接并解码。';
   els.prevButton.disabled = index === 0;
   els.nextButton.disabled = index === state.packets.length - 1;
   els.copyPacketButton.disabled = false;
@@ -290,13 +394,18 @@ async function handleGenerate() {
   stopAutoAdvance();
 
   try {
-    const result = splitIntoPackets(text);
+    els.generateButton.disabled = true;
+    els.generateButton.textContent = '生成中...';
+    const result = await splitIntoPackets(text);
     state.packets = result.packets;
     state.packetIndex = 0;
     await renderPacket(0);
+    const compressionText = result.compression?.enabled
+      ? ` · gzip ${formatBytes(result.compression.originalBytes)} -> ${formatBytes(result.compression.transferBytes)}`
+      : '';
     els.sendSessionInfo.textContent = result.mode === 'single'
       ? `已生成 1 张二维码 · 纠错 ${result.ecc}`
-      : `已生成 ${result.packets.length} 张二维码 · 纠错 ${result.ecc}`;
+      : `已生成 ${result.packets.length} 张二维码 · 纠错 ${result.ecc}${compressionText}`;
     updateSendUi();
     setToast(result.mode === 'single' ? '已生成单码。' : `已生成 ${result.packets.length} 个分片。`);
   } catch (error) {
@@ -304,6 +413,9 @@ async function handleGenerate() {
     state.packets = [];
     updateSendUi();
     setToast(error.message || '生成失败，请缩短文本后重试。');
+  } finally {
+    els.generateButton.disabled = false;
+    els.generateButton.textContent = '生成二维码';
   }
 }
 
@@ -325,7 +437,15 @@ function updateSessionUi() {
   els.receiveSessionInfo.textContent = `会话 ${session.transferId} · 已收 ${received}/${session.total}`;
 }
 
-function tryAssembleSession() {
+async function decodePacketPayload(packet, joined) {
+  const bytes = fromBase64Url(joined);
+  if (packet.codec === CODEC_GZIP) {
+    return new TextDecoder().decode(await gunzipBytes(bytes));
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+async function tryAssembleSession() {
   const session = state.scanSession;
   if (!session) {
     return;
@@ -334,16 +454,21 @@ function tryAssembleSession() {
     return;
   }
   const joined = session.parts.join('');
-  const decoded = new TextDecoder().decode(fromBase64Url(joined));
-  els.resultOutput.value = decoded;
-  els.resultMeta.textContent = `已完成拼接 · ${decoded.length} 字符 · ${new TextEncoder().encode(decoded).length} 字节`;
-  setToast('已收齐全部分片。');
-  if (state.stream) {
-    stopCamera();
+  try {
+    const decoded = await decodePacketPayload(session, joined);
+    els.resultOutput.value = decoded;
+    els.resultMeta.textContent = `已完成拼接 · ${decoded.length} 字符 · ${new TextEncoder().encode(decoded).length} 字节`;
+    setToast(session.codec === CODEC_GZIP ? '已收齐并解压。' : '已收齐全部分片。');
+    if (state.stream) {
+      stopCamera();
+    }
+  } catch (error) {
+    console.error(error);
+    setToast(error.message || '解码失败，请重新扫描。');
   }
 }
 
-function consumeDecodedText(raw) {
+async function consumeDecodedText(raw) {
   if (!raw || raw === state.lastScanValue) {
     return;
   }
@@ -370,21 +495,23 @@ function consumeDecodedText(raw) {
     state.scanSession = {
       transferId: packet.transferId,
       total: packet.total,
+      codec: packet.codec,
       parts: new Array(packet.total).fill(''),
     };
   }
 
-  if (state.scanSession.total !== packet.total) {
+  if (state.scanSession.total !== packet.total || state.scanSession.codec !== packet.codec) {
     state.scanSession = {
       transferId: packet.transferId,
       total: packet.total,
+      codec: packet.codec,
       parts: new Array(packet.total).fill(''),
     };
   }
 
   state.scanSession.parts[packet.index - 1] = packet.payload;
   updateSessionUi();
-  tryAssembleSession();
+  await tryAssembleSession();
 }
 
 async function decodeBitmapWithNative(bitmapSource) {
@@ -428,7 +555,7 @@ async function scanVideoFrame() {
   ctx.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
   const value = await decodeFromCanvas(captureCanvas);
   if (value) {
-    consumeDecodedText(value);
+    await consumeDecodedText(value);
   }
 }
 
@@ -488,7 +615,7 @@ async function decodeImageFile() {
     setToast('这张图片里没有识别到二维码。');
     return;
   }
-  consumeDecodedText(value);
+  await consumeDecodedText(value);
   setToast('图片识别完成。');
 }
 
